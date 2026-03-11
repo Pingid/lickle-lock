@@ -1,0 +1,10 @@
+.DS_Store
+target
+node_modules
+dist
+*.tsbuildinfo
+.vscode
+*.node
+index.d.ts
+esm.js
+cjs.js

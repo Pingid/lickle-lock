@@ -1,0 +1,15 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "rootDir": "lib",
+    "noEmit": false,
+    "outDir": "dist/cjs",
+    "module": "commonjs",
+    "moduleResolution": "classic",
+    "baseUrl": ".",
+    "paths": {
+      "#native": ["./index.d.ts"]
+    }
+  },
+  "include": ["lib/**/*"]
+}

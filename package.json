@@ -1,0 +1,100 @@
+{
+  "name": "@lickle/lock",
+  "version": "0.0.1-alpha.0",
+  "description": "File-based locking for Node.js using native OS locks (flock on Unix, LockFileEx on Windows). Exclusive and shared locks with cross-process coordination.",
+  "author": "Dan Beaven <dm.beaven@gmail.com>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Pingid/lickle-lock.git"
+  },
+  "homepage": "https://github.com/Pingid/lickle-lock#readme",
+  "bugs": {
+    "url": "https://github.com/Pingid/lickle-lock/issues"
+  },
+  "license": "MIT",
+  "type": "module",
+  "main": "dist/cjs/index.js",
+  "types": "dist/esm/index.d.ts",
+  "module": "dist/esm/index.js",
+  "sideEffects": false,
+  "exports": {
+    "./package.json": "./package.json",
+    ".": {
+      "types": "./dist/esm/index.d.ts",
+      "import": "./dist/esm/index.js",
+      "require": "./dist/cjs/index.js"
+    }
+  },
+  "imports": {
+    "#native": {
+      "types": "./index.d.ts",
+      "import": "./esm.js",
+      "require": "./cjs.js"
+    }
+  },
+  "keywords": [
+    "lock",
+    "file-lock",
+    "flock",
+    "mutex",
+    "exclusive-lock",
+    "shared-lock",
+    "read-write-lock",
+    "cross-process",
+    "napi",
+    "native"
+  ],
+  "files": [
+    "dist",
+    "index.d.ts",
+    "esm.js",
+    "cjs.js",
+    "README.md",
+    "LICENSE"
+  ],
+  "napi": {
+    "binaryName": "lickle-lock",
+    "targets": [
+      "x86_64-pc-windows-msvc",
+      "x86_64-apple-darwin",
+      "x86_64-unknown-linux-gnu",
+      "aarch64-apple-darwin"
+    ]
+  },
+  "engines": {
+    "node": ">= 6.14.2 < 7 || >= 8.11.2 < 9 || >= 9.11.0 < 10 || >= 10.0.0"
+  },
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/",
+    "access": "public"
+  },
+  "scripts": {
+    "artifacts": "napi artifacts",
+    "build": "node scripts/build.js",
+    "prepublishOnly": "napi prepublish -t npm",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest",
+    "preversion": "napi build --platform && git add .",
+    "version": "napi version"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "^3.2.0",
+    "@types/node": "^25.5.0",
+    "prettier": "^3.6.2",
+    "typescript": "^5.9.2",
+    "vitest": "^4.1.0"
+  },
+  "prettier": {
+    "printWidth": 120,
+    "semi": false,
+    "trailingComma": "all",
+    "singleQuote": true,
+    "arrowParens": "always"
+  },
+  "optionalDependencies": {
+    "@lickle/lock-win32-x64-msvc": "0.0.1-alpha.0",
+    "@lickle/lock-darwin-x64": "0.0.1-alpha.0",
+    "@lickle/lock-linux-x64-gnu": "0.0.1-alpha.0",
+    "@lickle/lock-darwin-arm64": "0.0.1-alpha.0"
+  }
+}

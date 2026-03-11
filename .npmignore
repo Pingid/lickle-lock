@@ -1,0 +1,16 @@
+.cargo
+.github
+lib
+node_modules
+scripts
+src
+target
+tests
+.gitignore
+build.js
+Cargo.lock
+Cargo.toml
+pnpm-lock.yaml
+tsconfig.cjs.json
+tsconfig.esm.json
+tsconfig.json
