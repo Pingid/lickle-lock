@@ -1,6 +1,7 @@
 import { Worker } from 'node:worker_threads'
 import type EventEmitter from 'node:events'
 import { fork } from 'node:child_process'
+import crypto from 'node:crypto'
 
 import type * as Lock from '../../dist/esm/index.js'
 import * as Util from './util.js'
@@ -67,13 +68,37 @@ export type Exec = <A extends any[], R>(f: (ctx: Context, ...args: A) => R, args
 
 const createExec =
   (child: EventEmitter, send: (message: any) => void): Exec =>
-  async (f, args) =>
+  (f, args) =>
     new Promise<any>((resolve, reject) => {
-      child.once('message', (msg: any) => {
+      const id = crypto.randomUUID()
+
+      const onMessage = (msg: any) => {
+        // Ignore messages not belonging to this invocation (e.g. debug output).
+        if (msg?.id !== id) return
+        cleanup()
         if (msg.ok) resolve(msg.result)
-        else reject(msg.error)
-      })
-      child.once('exit', reject)
-      child.once('error', reject)
-      send({ code: f.toString(), args })
+        else reject(Object.assign(new Error(msg.error.message), msg.error))
+      }
+
+      const onExit = (code: number | null) => {
+        cleanup()
+        reject(new Error(`Child exited with code ${code ?? 'null'} before responding to exec id ${id}`))
+      }
+
+      const onError = (err: Error) => {
+        cleanup()
+        reject(err)
+      }
+
+      const cleanup = () => {
+        child.off('message', onMessage)
+        child.off('exit', onExit)
+        child.off('error', onError)
+      }
+
+      child.on('message', onMessage)
+      child.once('exit', onExit)
+      child.once('error', onError)
+
+      send({ id, code: f.toString(), args })
     })

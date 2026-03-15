@@ -18,11 +18,11 @@ export interface Backend<H extends FileHandle> extends Lockable<H> {
 /** Lock/unlock operations, separated from file opening for composability. */
 export interface Lockable<H extends FileHandle> {
   /** Acquire a lock, polling until available or timeout is reached. */
-  lock: (handle: H, mode: 'exclusive' | 'shared', options?: { pollMs?: number; timeout?: number }) => Promise<void>
+  lock: (handle: H, mode: 'exclusive' | 'shared', options?: BlockingOptions) => Promise<void>
   /** Try to acquire a lock without waiting. Return true if acquired. */
-  tryLock: (handle: H, mode: 'exclusive' | 'shared') => Promise<boolean>
+  tryLock: (handle: H, mode: 'exclusive' | 'shared', options?: NonBlockingOptions) => Promise<boolean>
   /** Release a previously acquired lock. */
-  unlock: (handle: H) => Promise<void>
+  unlock: (handle: H, range?: LockRange) => Promise<void>
 }
 
 /** Represents an open file descriptor with its path. */
@@ -31,4 +31,22 @@ export interface FileHandle {
   readonly path: string
   close(): Promise<void>
   handle: any
+}
+
+/** Options for blocking lock acquisition with polling. */
+export interface BlockingOptions {
+  pollMs?: number
+  timeout?: number
+  range?: LockRange
+}
+
+/** Options for non-blocking (try) lock acquisition. */
+export interface NonBlockingOptions {
+  range?: LockRange
+}
+
+/** Byte range within a file to lock. Used for range-level locking. */
+export interface LockRange {
+  offset: number
+  length: number
 }

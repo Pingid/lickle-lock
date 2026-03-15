@@ -1,4 +1,4 @@
-import type { Backend, FileHandle } from './index.js'
+import type { Backend, FileHandle, LockRange } from './index.js'
 
 /**
  * RAII guard that holds a file lock. Unlocks and closes the file on drop.
@@ -22,6 +22,7 @@ export class FileGuard<H extends FileHandle> {
   constructor(
     private backend: Backend<H>,
     private hndl: H,
+    private range?: LockRange,
   ) {
     this.path = hndl.path
     this.fd = hndl.fd
@@ -43,7 +44,7 @@ export class FileGuard<H extends FileHandle> {
     if (!this._dropped) {
       this._dropped = (async () => {
         try {
-          await this.backend.unlock(this.hndl)
+          await this.backend.unlock(this.hndl, this.range)
         } finally {
           await this.hndl.close()
         }

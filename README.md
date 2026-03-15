@@ -11,6 +11,7 @@ Supports:
 
 - **Exclusive (write) locks**
 - **Shared (read) locks**
+- **Range (byte-level) locks**
 - **Cross-process / cross-thread coordination**
 - **Automatic cleanup** on exit, signals, and garbage collection
 
@@ -120,11 +121,14 @@ Both `exclusive` and `shared` accept:
 
 ```ts
 {
-  pollMs?: number   // polling interval (default: 10ms)
-  timeout?: number  // max wait time before throwing
-  backend?: Backend // custom backend
+  pollMs?: number    // polling interval (default: 10ms)
+  timeout?: number   // max wait time before throwing
+  range?: LockRange  // byte range to lock (see Range Locks)
+  backend?: Backend  // custom backend
 }
 ```
+
+`tryExclusive` and `tryShared` accept `range` and `backend` only.
 
 Example:
 
@@ -140,6 +144,38 @@ If the lock cannot be acquired within the timeout:
 ```
 Error: Timed out acquiring lock
 ```
+
+---
+
+# Range Locks
+
+Lock a specific byte range within a file instead of the entire file. This allows multiple processes to lock different regions concurrently.
+
+```ts
+import { exclusive, shared } from '@lickle/lock'
+
+// lock bytes 0–99
+await using header = await exclusive('/tmp/data.bin', {
+  range: { offset: 0, length: 100 },
+})
+
+// lock bytes 100–199 concurrently — no conflict
+await using body = await exclusive('/tmp/data.bin', {
+  range: { offset: 100, length: 100 },
+})
+```
+
+Range locks also work with `shared`, `tryExclusive`, and `tryShared`.
+
+```ts
+const guard = await tryExclusive('/tmp/data.bin', {
+  range: { offset: 0, length: 512 },
+})
+```
+
+When no range is specified, the entire file is locked (the default).
+
+On Unix, range locks use `fcntl` OFD locks (Linux 3.15+) or POSIX `fcntl` locks (macOS/BSD). On Windows, they use ranged `LockFileEx`/`UnlockFileEx`.
 
 ---
 
@@ -196,8 +232,8 @@ This prevents stale locks if your program crashes.
 
 The default backend uses native OS locks:
 
-- **Unix:** `flock`
-- **Windows:** `LockFileEx`
+- **Unix:** `flock` (whole-file), `fcntl` OFD locks (byte-range)
+- **Windows:** `LockFileEx` / `UnlockFileEx` (both whole-file and byte-range)
 
 You can implement custom backends for alternative file systems or environments.
 

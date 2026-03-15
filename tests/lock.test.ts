@@ -2,7 +2,7 @@ import { it, describe, expect, beforeAll, afterAll } from 'vitest'
 import path from 'node:path'
 import fs from 'node:fs'
 
-import { exclusive, shared, tryExclusive, tryShared } from '../dist/esm/index.js'
+import { exclusive, shared, tryExclusive, tryShared, createLockable, type FileHandle } from '../dist/esm/index.js'
 import { spawnWorker, Util, type Exec, spawnChild } from './util/index.js'
 
 const locksDir = path.join(import.meta.dirname, './locks')
@@ -221,6 +221,290 @@ describe('exclusive vs shared interactions', () => {
   })
 })
 
+describe('range locks', () => {
+  it('non-overlapping ranges do not conflict', async () => {
+    const file = getPath('range-no-conflict')
+
+    const guard1 = await exclusive(file, { range: { offset: 0, length: 10 } })
+    const guard2 = await tryExclusive(file, { range: { offset: 10, length: 10 } })
+
+    expect(guard2).toBeDefined()
+
+    await guard1.drop()
+    await guard2?.drop()
+  })
+
+  it('shared range locks allow concurrent readers on the same range', async () => {
+    const file = getPath('range-shared')
+
+    const reader1 = await shared(file, { range: { offset: 0, length: 100 } })
+    const reader2 = await tryShared(file, { range: { offset: 0, length: 100 } })
+
+    expect(reader2).toBeDefined()
+
+    await reader1.drop()
+    await reader2?.drop()
+  })
+
+  it('exclusive range does not block non-overlapping shared', async () => {
+    const file = getPath('range-excl-no-block-shared')
+
+    const writer = await exclusive(file, { range: { offset: 0, length: 10 } })
+    const reader = await tryShared(file, { range: { offset: 10, length: 10 } })
+
+    expect(reader).toBeDefined()
+
+    await writer.drop()
+    await reader?.drop()
+  })
+
+  it('releases range lock correctly on guard drop', async () => {
+    const file = getPath('range-release')
+
+    const guard1 = await exclusive(file, { range: { offset: 0, length: 10 } })
+    await guard1.drop()
+
+    const guard2 = await tryExclusive(file, { range: { offset: 0, length: 10 } })
+    expect(guard2).toBeDefined()
+    await guard2?.drop()
+  })
+
+  it('concurrent writes to different ranges are safe', async () => {
+    const file = getPath('range-concurrent-writes')
+    const count = 10
+
+    await Promise.all(
+      Array.from({ length: count }).map(async (_, i) => {
+        const offset = i * 4
+        await using guard = await exclusive(file, { range: { offset, length: 4 } })
+        const buf = Buffer.alloc(4)
+        buf.writeUint32LE(i + 1, 0)
+        await guard.handle.write(buf, 0, 4, offset)
+      }),
+    )
+
+    // Verify each range was written correctly
+    await using guard = await shared(file, { range: { offset: 0, length: count * 4 } })
+    for (let i = 0; i < count; i++) {
+      const buf = Buffer.alloc(4)
+      await guard.handle.read(buf, 0, 4, i * 4)
+      expect(buf.readUint32LE(0)).toBe(i + 1)
+    }
+  })
+})
+
+describe('range lock contention (cross-process)', () => {
+  // fcntl range locks are per-process on macOS (F_SETLK), per-fd on Linux (F_OFD_SETLK).
+  // Contention tests must use child processes to work on both platforms.
+
+  it('overlapping exclusive ranges conflict', async () => {
+    const file = getPath('range-overlap')
+
+    const child = await spawnChild()
+    await child.exec(
+      async ({ exclusive }, file) => {
+        globalThis.__lock = await exclusive(file, { range: { offset: 0, length: 20 } })
+        return 'locked'
+      },
+      [file],
+    )
+
+    const guard = await tryExclusive(file, { range: { offset: 10, length: 20 } })
+    expect(guard).toBeUndefined()
+
+    child.kill()
+    await child.exit
+  })
+
+  it('exclusive range blocks shared on overlapping range', async () => {
+    const file = getPath('range-excl-blocks-shared')
+
+    const child = await spawnChild()
+    await child.exec(
+      async ({ exclusive }, file) => {
+        globalThis.__lock = await exclusive(file, { range: { offset: 0, length: 50 } })
+        return 'locked'
+      },
+      [file],
+    )
+
+    const guard = await tryShared(file, { range: { offset: 25, length: 50 } })
+    expect(guard).toBeUndefined()
+
+    child.kill()
+    await child.exit
+  })
+
+  it('shared range blocks exclusive on overlapping range', async () => {
+    const file = getPath('range-shared-blocks-excl')
+
+    const child = await spawnChild()
+    await child.exec(
+      async ({ shared }, file) => {
+        globalThis.__lock = await shared(file, { range: { offset: 0, length: 50 } })
+        return 'locked'
+      },
+      [file],
+    )
+
+    const guard = await tryExclusive(file, { range: { offset: 25, length: 50 } })
+    expect(guard).toBeUndefined()
+
+    child.kill()
+    await child.exit
+  })
+
+  it('polling acquires range lock after holder exits', async () => {
+    const file = getPath('range-poll')
+
+    const child = await spawnChild()
+    await child.exec(
+      async ({ exclusive }, file) => {
+        globalThis.__lock = await exclusive(file, { range: { offset: 0, length: 10 } })
+        return 'locked'
+      },
+      [file],
+    )
+
+    let acquired = false
+    const pollingPromise = exclusive(file, { range: { offset: 0, length: 10 }, pollMs: 10 }).then((g) => {
+      acquired = true
+      return g
+    })
+
+    await new Promise((r) => setTimeout(r, 50))
+    expect(acquired).toBe(false)
+
+    // Killing the child releases its lock
+    child.kill()
+    await child.exit
+
+    const guard = await pollingPromise
+    expect(acquired).toBe(true)
+    await guard.drop()
+  })
+
+  it('range lock timeout works', async () => {
+    const file = getPath('range-timeout')
+
+    const child = await spawnChild()
+    await child.exec(
+      async ({ exclusive }, file) => {
+        globalThis.__lock = await exclusive(file, { range: { offset: 0, length: 10 } })
+        return 'locked'
+      },
+      [file],
+    )
+
+    const attempt = exclusive(file, { range: { offset: 0, length: 10 }, timeout: 100, pollMs: 20 })
+    await expect(attempt).rejects.toThrow(/Timed out/)
+
+    child.kill()
+    await child.exit
+  })
+})
+
+describe('range validation', () => {
+  it('rejects negative offset', async () => {
+    const file = getPath('neg-offset')
+    await expect(exclusive(file, { range: { offset: -1, length: 10 } })).rejects.toThrow(/overflow/)
+  })
+
+  it('rejects negative length', async () => {
+    const file = getPath('neg-length')
+    await expect(exclusive(file, { range: { offset: 0, length: -5 } })).rejects.toThrow(/Invalid/)
+  })
+
+  it('rejects zero length', async () => {
+    const file = getPath('zero-length')
+    await expect(exclusive(file, { range: { offset: 0, length: 0 } })).rejects.toThrow(/Zero-length/)
+  })
+
+  it('validates on shared, tryExclusive, and tryShared too', async () => {
+    const file = getPath('validate-all-paths')
+    const bad = { range: { offset: -1, length: 10 } }
+    await expect(shared(file, bad)).rejects.toThrow(/offset/)
+    await expect(tryExclusive(file, bad)).rejects.toThrow(/offset/)
+    await expect(tryShared(file, bad)).rejects.toThrow(/offset/)
+  })
+})
+
+describe('already-closed fd', () => {
+  it('guard.drop() rejects but still marks guard as dropped', async () => {
+    const file = getPath('closed-fd-drop')
+    const guard = await exclusive(file)
+
+    // Close the raw fd behind the guard's back
+    fs.closeSync(guard.fd)
+
+    // drop() will fail (EBADF on unlock/close), but guard should still be marked dropped
+    await expect(guard.drop()).rejects.toThrow()
+    expect(guard.dropped).toBe(true)
+  })
+
+  it('lock is released after fd is closed (new lock is acquirable)', async () => {
+    const file = getPath('closed-fd-reacquire')
+    const guard = await exclusive(file)
+    fs.closeSync(guard.fd)
+    await guard.drop().catch(() => {})
+
+    const guard2 = await tryExclusive(file)
+    expect(guard2).toBeDefined()
+    await guard2?.drop()
+  })
+})
+
+describe('hook state after unlock failure', () => {
+  it('unregister runs even when native unlock throws', async () => {
+    let unregisterCalled = false
+    const hooks = {
+      register: async () => {},
+      unregister: async () => {
+        unregisterCalled = true
+      },
+    }
+    const lockable = createLockable<FileHandle>(hooks)
+
+    // Use an invalid fd so native.unlock throws
+    const fakeHandle: FileHandle = { fd: -999, path: '/fake', handle: null, close: async () => {} }
+
+    await expect(lockable.unlock(fakeHandle)).rejects.toThrow()
+    expect(unregisterCalled).toBe(true)
+  })
+
+  it('unregister cleans up hook state after guard.drop() with closed fd', async () => {
+    let activeCount = 0
+    const hooks = {
+      register: async () => {
+        activeCount++
+      },
+      unregister: async () => {
+        activeCount--
+      },
+    }
+    const lockable = createLockable<FileHandle>(hooks)
+
+    const backend = {
+      async open(file: string) {
+        const h = await fs.promises.open(file, fs.constants.O_CREAT | fs.constants.O_RDWR)
+        return { fd: h.fd, path: file, handle: h, close: () => h.close() } as FileHandle
+      },
+      ...lockable,
+    }
+
+    const handle = await backend.open(getPath('hook-cleanup'))
+    await backend.lock(handle, 'exclusive')
+    expect(activeCount).toBe(1)
+
+    // Close fd to force unlock failure
+    fs.closeSync(handle.fd)
+    await backend.unlock(handle).catch(() => {})
+
+    // Hook should have decremented despite the unlock failure
+    expect(activeCount).toBe(0)
+  })
+})
+
 describe('signal handlers', () => {
   it('releases lock if child process is killed via SIGINT', async () => {
     const file = getPath('sigint-test')
@@ -228,7 +512,7 @@ describe('signal handlers', () => {
     const child = await spawnChild()
     await child.exec(
       async ({ exclusive }, file) => {
-        await exclusive(file)
+        globalThis.__lock = await exclusive(file)
         return 'locked'
       },
       [file],
@@ -247,7 +531,7 @@ describe('signal handlers', () => {
     const child = await spawnChild()
     await child.exec(
       async ({ exclusive }, file) => {
-        await exclusive(file)
+        globalThis.__lock = await exclusive(file)
         return 'locked'
       },
       [file],

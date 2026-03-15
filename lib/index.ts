@@ -1,4 +1,12 @@
-import { type Backend, type FileHandle, type NodeFileHandle, FileGuard, defaultBackend } from './backend/index.js'
+import {
+  type Backend,
+  type FileHandle,
+  type NodeFileHandle,
+  FileGuard,
+  BlockingOptions,
+  NonBlockingOptions,
+  defaultBackend,
+} from './backend/index.js'
 export * from './backend/index.js'
 
 /**
@@ -14,7 +22,7 @@ export * from './backend/index.js'
  */
 export const exclusive = async <H extends FileHandle = NodeFileHandle>(
   file: string,
-  options?: { backend?: Backend<H>; pollMs?: number; timeout?: number },
+  options?: { backend?: Backend<H> } & BlockingOptions,
 ): Promise<FileGuard<H>> => acquireLock(file, 'exclusive', options)
 
 /**
@@ -27,7 +35,7 @@ export const exclusive = async <H extends FileHandle = NodeFileHandle>(
  */
 export const tryExclusive = async <H extends FileHandle = NodeFileHandle>(
   file: string,
-  options?: { backend?: Backend<H> },
+  options?: { backend?: Backend<H> } & NonBlockingOptions,
 ): Promise<FileGuard<H> | undefined> => tryAcquireLock(file, 'exclusive', options)
 
 /**
@@ -40,7 +48,7 @@ export const tryExclusive = async <H extends FileHandle = NodeFileHandle>(
  */
 export const shared = async <H extends FileHandle = NodeFileHandle>(
   file: string,
-  options?: { backend?: Backend<H>; pollMs?: number; timeout?: number },
+  options?: { backend?: Backend<H> } & BlockingOptions,
 ): Promise<FileGuard<H>> => acquireLock(file, 'shared', options)
 
 /**
@@ -53,19 +61,19 @@ export const shared = async <H extends FileHandle = NodeFileHandle>(
  */
 export const tryShared = async <H extends FileHandle = NodeFileHandle>(
   file: string,
-  options?: { backend?: Backend<H> },
+  options?: { backend?: Backend<H> } & NonBlockingOptions,
 ): Promise<FileGuard<H> | undefined> => tryAcquireLock(file, 'shared', options)
 
 const acquireLock = async <H extends FileHandle = NodeFileHandle>(
   file: string,
   mode: 'exclusive' | 'shared',
-  options?: { backend?: Backend<H>; pollMs?: number; timeout?: number },
+  options?: { backend?: Backend<H> } & BlockingOptions,
 ): Promise<FileGuard<H>> => {
   const { backend = defaultBackend() as unknown as Backend<H> } = options ?? {}
   const handle = await backend.open(file)
   try {
     await backend.lock(handle, mode, options)
-    return new FileGuard<H>(backend, handle)
+    return new FileGuard<H>(backend, handle, options?.range)
   } catch (error) {
     await handle.close()
     throw error
@@ -75,13 +83,13 @@ const acquireLock = async <H extends FileHandle = NodeFileHandle>(
 const tryAcquireLock = async <H extends FileHandle = NodeFileHandle>(
   file: string,
   mode: 'exclusive' | 'shared',
-  options?: { backend?: Backend<H> },
+  options?: { backend?: Backend<H> } & NonBlockingOptions,
 ): Promise<FileGuard<H> | undefined> => {
   const { backend = defaultBackend() as unknown as Backend<H> } = options ?? {}
   const handle = await backend.open(file)
   try {
-    const result = await backend.tryLock(handle, mode)
-    if (result) return new FileGuard<H>(backend, handle)
+    const result = await backend.tryLock(handle, mode, options)
+    if (result) return new FileGuard<H>(backend, handle, options?.range)
     await handle.close()
     return undefined
   } catch (error) {

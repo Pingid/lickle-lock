@@ -45,26 +45,44 @@ export class NodeFileHandle implements FileHandle {
  * SIGINT, SIGTERM, and GC finalization.
  */
 export class NodeLockHooks implements LockHooks<FileHandle> {
-  private _active = new Set<number>()
+  private _active = new Map<number, number>()
+  private _tokens = new WeakMap<FileHandle, symbol>()
   private _handlingSignal = false
 
-  private _finalizer = new FinalizationRegistry<{ fd: number; path: string }>((held) => {
+  private _finalizer = new FinalizationRegistry<{ fd: number }>((held) => {
+    // Best-effort cleanup: closing the fd implicitly releases any held OS locks.
+    // This is only a fallback for leaked handles/guards.
     try {
       fs.closeSync(held.fd)
     } catch {
-      // EBADF (Bad file descriptor) is expected if the user or Node already closed it
+      // EBADF is fine here: fd may already be closed/reused.
     }
   })
 
   async register(handle: FileHandle): Promise<void> {
     if (this._active.size === 0) this._listen()
-    this._active.add(handle.fd)
-    this._finalizer.register(handle, { fd: handle.fd, path: handle.path }, handle)
+
+    const fd = handle.fd
+    this._active.set(fd, (this._active.get(fd) ?? 0) + 1)
+
+    const token = Symbol(`lock:${handle.path}:${fd}`)
+    this._tokens.set(handle, token)
+    this._finalizer.register(handle, { fd }, token)
   }
 
   async unregister(handle: FileHandle): Promise<void> {
-    this._finalizer.unregister(handle)
-    this._active.delete(handle.fd)
+    const token = this._tokens.get(handle)
+    if (token) {
+      this._finalizer.unregister(token)
+    }
+
+    const fd = handle.fd
+    const count = this._active.get(fd)
+    if (count !== undefined) {
+      if (count <= 1) this._active.delete(fd)
+      else this._active.set(fd, count - 1)
+    }
+
     if (this._active.size === 0) this._unlisten()
   }
 
@@ -89,11 +107,11 @@ export class NodeLockHooks implements LockHooks<FileHandle> {
   }
 
   private _onExit = (): void => {
-    for (const fd of Array.from(this._active.values()).reverse()) {
+    for (const fd of Array.from(this._active.keys()).reverse()) {
       try {
         fs.closeSync(fd)
       } catch {
-        // EBADF (Bad file descriptor) is expected if the user or Node already closed it
+        // EBADF expected if already closed
       }
     }
     this._active.clear()
@@ -102,6 +120,7 @@ export class NodeLockHooks implements LockHooks<FileHandle> {
   private _onSignal = (signal: string): void => {
     if (this._handlingSignal) return
     this._handlingSignal = true
+
     this._unlisten()
     this._onExit()
 

@@ -1,4 +1,4 @@
-import type { FileHandle, Lockable } from '../index.js'
+import type { FileHandle, LockRange, Lockable, BlockingOptions, NonBlockingOptions } from '../index.js'
 
 import * as native from '#native'
 
@@ -10,35 +10,49 @@ export interface LockHooks<H extends FileHandle> {
 
 /**
  * Create a `Lockable` using native OS lock bindings (flock on Unix, LockFileEx on Windows).
+ * When a range is specified, uses fcntl OFD locks (Unix) or ranged LockFileEx (Windows).
  * Optional hooks are notified on lock/unlock for cleanup tracking.
  *
  * @example
  * const lockable = createLockable(myHooks)
  */
-export const createLockable = <H extends FileHandle>(hooks?: LockHooks<H>): Lockable<H> => {
-  const lock = (handle: H, mode: 'exclusive' | 'shared', options?: native.PollFlockOptions): Promise<void> => {
-    if (mode === 'exclusive') return native.exclusive(handle.fd, options)
-    else return native.shared(handle.fd, options)
-  }
+export const createLockable = <H extends FileHandle>(hooks?: LockHooks<H>): Lockable<H> => ({
+  async lock(handle: H, mode: 'exclusive' | 'shared', options?: BlockingOptions): Promise<void> {
+    if (mode === 'exclusive') await native.exclusive(handle.fd, options)
+    else await native.shared(handle.fd, options)
 
-  const tryLock = (handle: H, mode: 'exclusive' | 'shared'): Promise<boolean> => {
-    if (mode === 'exclusive') return native.tryExclusive(handle.fd)
-    else return native.tryShared(handle.fd)
-  }
-
-  return {
-    async lock(handle: H, mode: 'exclusive' | 'shared', options?: native.PollFlockOptions): Promise<void> {
-      await lock(handle, mode, options)
+    try {
       await hooks?.register(handle)
-    },
-    async tryLock(handle: H, mode: 'exclusive' | 'shared'): Promise<boolean> {
-      const locked = await tryLock(handle, mode)
-      if (locked) await hooks?.register(handle)
-      return locked
-    },
-    async unlock(handle: H): Promise<void> {
+    } catch (err) {
+      try {
+        native.unlock(handle.fd, options?.range)
+      } catch {}
+      throw err
+    }
+  },
+
+  async tryLock(handle: H, mode: 'exclusive' | 'shared', options?: NonBlockingOptions): Promise<boolean> {
+    const locked =
+      mode === 'exclusive' ? await native.tryExclusive(handle.fd, options) : await native.tryShared(handle.fd, options)
+
+    if (!locked) return false
+
+    try {
+      await hooks?.register(handle)
+      return true
+    } catch (err) {
+      try {
+        native.unlock(handle.fd, options?.range)
+      } catch {}
+      throw err
+    }
+  },
+
+  async unlock(handle: H, range?: LockRange): Promise<void> {
+    try {
+      native.unlock(handle.fd, range)
+    } finally {
       await hooks?.unregister(handle)
-      await native.unlock(handle.fd)
-    },
-  }
-}
+    }
+  },
+})
