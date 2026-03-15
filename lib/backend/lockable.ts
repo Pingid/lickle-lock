@@ -18,23 +18,25 @@ export interface LockHooks<H extends FileHandle> {
  */
 export const createLockable = <H extends FileHandle>(hooks?: LockHooks<H>): Lockable<H> => ({
   async lock(handle: H, mode: 'exclusive' | 'shared', options?: BlockingOptions): Promise<void> {
-    if (mode === 'exclusive') await native.exclusive(handle.fd, options)
-    else await native.shared(handle.fd, options)
+    if (mode === 'exclusive') await native.lock(handle.fd, native.Lock.Exclusive, options?.range, options)
+    else await native.lock(handle.fd, native.Lock.Shared, options?.range, options)
 
     try {
       await hooks?.register(handle)
     } catch (err) {
       try {
-        native.unlock(handle.fd, options?.range)
+        native.lockSync(handle.fd, native.Lock.Unlock, options?.range)
       } catch {}
       throw err
     }
   },
 
   async tryLock(handle: H, mode: 'exclusive' | 'shared', options?: NonBlockingOptions): Promise<boolean> {
-    const locked =
-      mode === 'exclusive' ? await native.tryExclusive(handle.fd, options) : await native.tryShared(handle.fd, options)
-
+    const locked = await native.tryLock(
+      handle.fd,
+      mode === 'exclusive' ? native.Lock.Exclusive : native.Lock.Shared,
+      options?.range,
+    )
     if (!locked) return false
 
     try {
@@ -42,7 +44,7 @@ export const createLockable = <H extends FileHandle>(hooks?: LockHooks<H>): Lock
       return true
     } catch (err) {
       try {
-        native.unlock(handle.fd, options?.range)
+        native.lockSync(handle.fd, native.Lock.Unlock, options?.range)
       } catch {}
       throw err
     }
@@ -50,7 +52,7 @@ export const createLockable = <H extends FileHandle>(hooks?: LockHooks<H>): Lock
 
   async unlock(handle: H, range?: LockRange): Promise<void> {
     try {
-      native.unlock(handle.fd, range)
+      native.lockSync(handle.fd, native.Lock.Unlock, range)
     } finally {
       await hooks?.unregister(handle)
     }

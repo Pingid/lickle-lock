@@ -1,0 +1,45 @@
+name: Windows test
+env:
+  RUST_BACKTRACE: '1'
+  ACTIONS_STEP_DEBUG: 'true'
+  DEBUG: napi:*
+'on':
+  push:
+    branches:
+      - testing
+
+jobs:
+  run:
+    name: Run
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - name: Setup node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: pnpm
+      - name: Cache cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            ~/.napi-rs
+            .cargo-cache
+            target
+          key: windows-cargo-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'build.rs', 'src/**') }}
+          restore-keys: |
+            windows-cargo-
+      - name: Install dependencies
+        run: pnpm install --no-frozen-lockfile
+      - name: Build
+        run: pnpm build --target x86_64-pc-windows-msvc
+      - name: Run
+        run: pnpm tsx tests/windows.ts
+      - name: Run
+        run: pnpm test

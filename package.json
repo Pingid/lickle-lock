@@ -81,6 +81,7 @@
     "@napi-rs/cli": "^3.2.0",
     "@types/node": "^25.5.0",
     "prettier": "^3.6.2",
+    "tsx": "^4.21.0",
     "typescript": "^5.9.2",
     "vitest": "^4.1.0"
   },
@@ -92,9 +93,9 @@
     "arrowParens": "always"
   },
   "optionalDependencies": {
-    "@lickle/lock-win32-x64-msvc": "0.0.1-alpha.0",
+    "@lickle/lock-darwin-arm64": "0.0.1-alpha.0",
     "@lickle/lock-darwin-x64": "0.0.1-alpha.0",
     "@lickle/lock-linux-x64-gnu": "0.0.1-alpha.0",
-    "@lickle/lock-darwin-arm64": "0.0.1-alpha.0"
+    "@lickle/lock-win32-x64-msvc": "0.0.1-alpha.0"
   }
 }

@@ -17,6 +17,7 @@ pub fn file_lock(
     fd: FileDescriptor,
     lock: Lock,
     range: Option<(Offset, Length)>,
+    blocking: bool,
 ) -> std::io::Result<LockAttempt> {
     if let Some((offset, len)) = range {
         let lock_type = match lock {
@@ -27,11 +28,14 @@ pub fn file_lock(
         return fcntl_lock(fd, lock_type as libc::c_short, offset, len);
     }
 
-    let flag = match lock {
-        Lock::Exclusive => libc::LOCK_EX | libc::LOCK_NB,
-        Lock::Shared => libc::LOCK_SH | libc::LOCK_NB,
+    let mut flag = match lock {
+        Lock::Exclusive => libc::LOCK_EX,
+        Lock::Shared => libc::LOCK_SH,
         Lock::Unlock => libc::LOCK_UN,
     };
+    if !blocking {
+        flag |= libc::LOCK_NB;
+    }
     flock(fd, flag)
 }
 

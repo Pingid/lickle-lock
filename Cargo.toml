@@ -23,6 +23,7 @@ winapi = { version = "0.3.9", features = [
     "minwindef",
     "fileapi",
     "winnt",
+    "libloaderapi",
 ] }
 
 [build-dependencies]
