@@ -265,9 +265,34 @@ jobs:
         with:
           path: artifacts
 
+      - name: Restore root package files
+        if: steps.current_version.outputs.version != steps.latest_version.outputs.version
+        shell: bash
+        run: |
+          for dir in artifacts/bindings-*; do
+            if [ -d "$dir" ]; then
+              ARTIFACT_DIR="$dir"
+              break
+            fi
+          done
+
+          if [ -z "${ARTIFACT_DIR:-}" ]; then
+            echo "No binding artifacts were downloaded"
+            exit 1
+          fi
+
+          cp -R "$ARTIFACT_DIR/dist" ./dist
+          cp "$ARTIFACT_DIR/index.d.ts" ./index.d.ts
+          cp "$ARTIFACT_DIR/esm.js" ./esm.js
+          cp "$ARTIFACT_DIR/cjs.js" ./cjs.js
+
       - name: Move artifacts
         if: steps.current_version.outputs.version != steps.latest_version.outputs.version
         run: pnpm artifacts
+
+      - name: Verify npm pack contents
+        if: steps.current_version.outputs.version != steps.latest_version.outputs.version
+        run: npm pack --dry-run --ignore-scripts
 
       - name: Publish to npm
         if: steps.current_version.outputs.version != steps.latest_version.outputs.version
@@ -276,4 +301,5 @@ jobs:
           echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" >> ~/.npmrc
           npm publish --access public
         env:
+          GITHUB_TOKEN: ${{ github.token }}
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
