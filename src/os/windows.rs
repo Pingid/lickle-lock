@@ -1,134 +1,174 @@
 #![deny(clippy::all)]
 
-use crate::LockAttempt;
-use windows_sys::Win32::Foundation::{GetLastError, SetLastError, NO_ERROR};
-use windows_sys::Win32::Storage::FileSystem::{
-    GetFileType, LockFileEx, UnlockFileEx, FILE_TYPE_DISK, FILE_TYPE_UNKNOWN,
-    LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY,
-};
-use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
-use windows_sys::Win32::System::IO::OVERLAPPED;
+use crate::{Lock, LockAttempt};
 
-pub type FileDescriptor = i64;
+use std::mem::MaybeUninit;
+use winapi::shared::minwindef::{DWORD, HMODULE, TRUE};
+use winapi::shared::winerror::{ERROR_IO_PENDING, ERROR_LOCK_VIOLATION};
+use winapi::um::fileapi::{LockFileEx, UnlockFileEx};
+use winapi::um::handleapi::CloseHandle;
+use winapi::um::ioapiset::GetOverlappedResult;
+use winapi::um::libloaderapi::{GetModuleHandleA, GetProcAddress};
+use winapi::um::minwinbase::{LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, OVERLAPPED};
+use winapi::um::synchapi::CreateEventW;
+use winapi::um::winnt::HANDLE;
 
-pub fn try_lock_exclusive(fd: FileDescriptor) -> std::io::Result<LockAttempt> {
-    // LOCKFILE_FAIL_IMMEDIATELY is required so polling can detect contention.
-    attempt_lock(fd, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY)
-}
+pub type FileDescriptor = i32;
+pub type Offset = u64;
+pub type Length = u64;
 
-pub fn try_lock_shared(fd: FileDescriptor) -> std::io::Result<LockAttempt> {
-    attempt_lock(fd, LOCKFILE_FAIL_IMMEDIATELY)
-}
+/// Acquire, release, or test a file lock using `LockFileEx`/`UnlockFileEx`.
+///
+/// When `range` is `None` the entire file is locked (`0..u64::MAX`).
+/// For blocking requests on overlapped handles, an event is attached so
+/// `GetOverlappedResult` can wait for `ERROR_IO_PENDING`.
+pub fn file_lock(
+    fd: FileDescriptor,
+    lock: Lock,
+    range: Option<(Offset, Length)>,
+    blocking: bool,
+) -> std::io::Result<LockAttempt> {
+    let (offset, len) = range.unwrap_or((0, u64::MAX));
 
-pub fn unlock(fd: FileDescriptor) -> std::io::Result<()> {
-    let handle = get_handle(fd)?;
-    let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+    let handle = get_windows_handle(fd)?;
 
-    let success = unsafe {
-        UnlockFileEx(
-            handle as _,
-            0,
-            0xFFFFFFFF, // Unlock the maximum possible length (entire file)
-            0xFFFFFFFF,
-            &mut overlapped,
-        )
-    };
-
-    if success != 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
+    let mut ov: OVERLAPPED = unsafe { MaybeUninit::zeroed().assume_init() };
+    unsafe {
+        let s = ov.u.s_mut();
+        s.Offset = (offset & 0xffff_ffff) as DWORD;
+        s.OffsetHigh = (offset >> 32) as DWORD;
     }
-}
 
-fn attempt_lock(fd: FileDescriptor, flags: u32) -> std::io::Result<LockAttempt> {
-    let handle = get_handle(fd)?;
-    let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+    let len_low = (len & 0xffff_ffff) as DWORD;
+    let len_high = (len >> 32) as DWORD;
 
-    let success = unsafe {
-        LockFileEx(
-            handle as _,
-            flags,
-            0,
-            0xFFFFFFFF, // Lock the maximum possible length (entire file)
-            0xFFFFFFFF,
-            &mut overlapped,
-        )
+    // For blocking lock attempts on overlapped handles, attach an event so we can
+    // wait via GetOverlappedResult if LockFileEx returns ERROR_IO_PENDING.
+    let _event = if blocking && !matches!(lock, Lock::Unlock) {
+        let event = create_event()?;
+        ov.hEvent = event.0;
+        Some(event)
+    } else {
+        None
     };
 
-    if success != 0 {
+    let rc = unsafe {
+        match lock {
+            Lock::Exclusive => {
+                let mut flags = LOCKFILE_EXCLUSIVE_LOCK;
+                if !blocking {
+                    flags |= LOCKFILE_FAIL_IMMEDIATELY;
+                }
+                LockFileEx(handle, flags, 0, len_low, len_high, &mut ov)
+            }
+            Lock::Shared => {
+                let mut flags = 0;
+                if !blocking {
+                    flags |= LOCKFILE_FAIL_IMMEDIATELY;
+                }
+                LockFileEx(handle, flags, 0, len_low, len_high, &mut ov)
+            }
+            Lock::Unlock => UnlockFileEx(handle, 0, len_low, len_high, &mut ov),
+        }
+    };
+
+    if rc != 0 {
         return Ok(LockAttempt::Acquired);
     }
 
     let err = std::io::Error::last_os_error();
-    let code = err.raw_os_error().unwrap_or(0);
-
-    // 33: ERROR_LOCK_VIOLATION
-    // 32: ERROR_SHARING_VIOLATION
-    if code == 33 || code == 32 {
-        return Ok(LockAttempt::WouldBlock);
-    }
-
-    Err(err)
-}
-
-fn get_handle(fd: FileDescriptor) -> std::io::Result<isize> {
-    // Convert Node/libuv file descriptor to OS HANDLE via uv_get_osfhandle.
-    let fd_i32 = i32::try_from(fd).map_err(|_| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("Invalid file descriptor value for Windows backend: {}", fd),
-        )
-    })?;
-
-    if let Some(handle) = uv_get_osfhandle(fd_i32) {
-        if handle != -1 && handle != 0 && is_lockable_file_handle(handle) {
-            return Ok(handle);
+    match err.raw_os_error().map(|c| c as u32) {
+        Some(ERROR_LOCK_VIOLATION) if !blocking && !matches!(lock, Lock::Unlock) => {
+            Ok(LockAttempt::WouldBlock)
         }
-    }
 
-    // Fallback: some runtimes may expose raw HANDLE-like numeric values.
-    let raw = fd as isize;
-    if raw != 0 && raw != -1 && is_lockable_file_handle(raw) {
-        return Ok(raw);
-    }
+        // Blocking path on an overlapped handle: wait for the pending lock to complete.
+        Some(ERROR_IO_PENDING) if blocking && !matches!(lock, Lock::Unlock) => {
+            let mut transferred: DWORD = 0;
+            let ok = unsafe { GetOverlappedResult(handle, &mut ov, &mut transferred, TRUE) };
+            if ok != 0 {
+                Ok(LockAttempt::Acquired)
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        }
 
-    Err(std::io::Error::new(
-        std::io::ErrorKind::InvalidInput,
-        format!("Invalid file descriptor or handle: {}", fd),
-    ))
+        _ => Err(err),
+    }
 }
 
-type UvGetOsfHandleFn = unsafe extern "C" fn(i32) -> isize;
+struct OwnedHandle(HANDLE);
 
-fn uv_get_osfhandle(fd: i32) -> Option<isize> {
-    unsafe {
-        let node = GetModuleHandleA(b"node.exe\0".as_ptr());
-        if !node.is_null() {
-            let sym = GetProcAddress(node, b"uv_get_osfhandle\0".as_ptr());
-            if let Some(sym) = sym {
-                let func: UvGetOsfHandleFn = std::mem::transmute(sym);
-                return Some(func(fd));
+impl Drop for OwnedHandle {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe {
+                CloseHandle(self.0);
             }
         }
     }
-    None
 }
 
-fn is_valid_file_handle(handle: isize) -> bool {
-    unsafe {
-        SetLastError(NO_ERROR);
-        let file_type = GetFileType(handle as _);
-        if file_type == FILE_TYPE_UNKNOWN {
-            return GetLastError() == NO_ERROR;
+/// Create a manual-reset event for overlapped I/O waits.
+fn create_event() -> std::io::Result<OwnedHandle> {
+    let event = unsafe { CreateEventW(std::ptr::null_mut(), TRUE, 0, std::ptr::null()) };
+    if event.is_null() {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(OwnedHandle(event))
+    }
+}
+
+/// Convert a C file descriptor to a Windows `HANDLE` via libuv's `uv_get_osfhandle`.
+fn get_windows_handle(fd: i32) -> std::io::Result<HANDLE> {
+    let uv_get_osfhandle = resolve_uv_get_osfhandle()?;
+    let handle = unsafe { uv_get_osfhandle(fd) };
+
+    if handle.is_null() || handle == (-1isize as HANDLE) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("invalid OS handle for fd {}", fd),
+        ));
+    }
+
+    Ok(handle)
+}
+
+type UvGetOsfHandle = unsafe extern "C" fn(i32) -> HANDLE;
+
+/// Resolve `uv_get_osfhandle` from the host Node.js process. Tries
+/// `libnode.dll`, `node.dll`, and the implicit module in that order.
+fn resolve_uv_get_osfhandle() -> std::io::Result<UvGetOsfHandle> {
+    static FN: std::sync::OnceLock<Option<UvGetOsfHandle>> = std::sync::OnceLock::new();
+
+    let f = FN.get_or_init(|| unsafe {
+        let name = c"uv_get_osfhandle";
+
+        let candidates: [HMODULE; 3] = [
+            GetModuleHandleA(c"libnode.dll".as_ptr() as _),
+            GetModuleHandleA(c"node.dll".as_ptr() as _),
+            GetModuleHandleA(std::ptr::null()),
+        ];
+
+        for module in candidates {
+            if module.is_null() {
+                continue;
+            }
+
+            let ptr = GetProcAddress(module, name.as_ptr() as _);
+            if !ptr.is_null() {
+                let f: UvGetOsfHandle = std::mem::transmute(ptr);
+                return Some(f);
+            }
         }
-        true
-    }
-}
 
-fn is_lockable_file_handle(handle: isize) -> bool {
-    if !is_valid_file_handle(handle) {
-        return false;
-    }
-    unsafe { GetFileType(handle as _) == FILE_TYPE_DISK }
+        None
+    });
+
+    f.ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "could not resolve uv_get_osfhandle from host process",
+        )
+    })
 }

@@ -12,7 +12,7 @@ const run = (cmd, args) =>
 
 const args = process.argv.slice(2)
 
-const common = ['build', '--release', '--platform']
+const common = ['build', '--release', '--platform', '--no-const-enum']
 await run('napi', [...common, '--esm', '--js', './esm.js', ...args])
 await run('napi', [...common, '--js', './cjs.js', ...args])
 

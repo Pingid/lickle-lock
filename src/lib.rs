@@ -1,96 +1,179 @@
 #![deny(clippy::all)]
 
 use napi_derive::napi;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 mod os;
 
+/// Lock mode passed to the native OS locking call.
 #[napi]
-pub async fn exclusive(
+#[derive(Clone, Copy)]
+pub enum Lock {
+    Exclusive,
+    Shared,
+    Unlock,
+}
+
+/// Byte range within a file. Offset and length are signed to allow
+/// validation at the Rust boundary before casting to the OS types.
+#[napi(object)]
+#[derive(Debug, Clone, Copy)]
+pub struct LockRange {
+    pub offset: i64,
+    pub length: i64,
+}
+
+/// Result of a single non-blocking lock attempt.
+pub enum LockAttempt {
+    Acquired,
+    WouldBlock,
+}
+
+/// Acquire a lock, polling until available or timeout is reached.
+#[napi]
+pub async fn lock(
     fd: os::FileDescriptor,
-    options: Option<PollFlockOptions>,
+    lock: Lock,
+    range: Option<LockRange>,
+    options: Option<PollOptions>,
 ) -> napi::Result<()> {
-    poll_lock(options, move || os::try_lock_exclusive(fd))
-        .await
-        .map(|_| {})
+    poll_lock(fd, lock, range, options).await
 }
 
+/// Acquire a lock synchronously (blocks the thread).
 #[napi]
-pub async fn try_exclusive(fd: os::FileDescriptor) -> napi::Result<bool> {
-    try_lock_async(fd, os::try_lock_exclusive)
-        .await
-        .map(|attempt| matches!(attempt, LockAttempt::Acquired))
-}
-
-#[napi]
-pub async fn shared(fd: os::FileDescriptor, options: Option<PollFlockOptions>) -> napi::Result<()> {
-    poll_lock(options, move || os::try_lock_shared(fd))
-        .await
-        .map(|_| {})
-}
-
-#[napi]
-pub async fn try_shared(fd: os::FileDescriptor) -> napi::Result<bool> {
-    try_lock_async(fd, os::try_lock_shared)
-        .await
-        .map(|attempt| matches!(attempt, LockAttempt::Acquired))
-}
-
-#[napi]
-pub fn unlock(fd: os::FileDescriptor) -> napi::Result<()> {
-    os::unlock(fd)?;
+pub fn lock_sync(fd: os::FileDescriptor, lock: Lock, range: Option<LockRange>) -> napi::Result<()> {
+    let range = range.map(TryInto::try_into).transpose()?;
+    os::file_lock(fd, lock, range, true).map_err(io_error)?;
     Ok(())
 }
 
-async fn try_lock_async(
+/// Try to acquire a lock without waiting. Returns `true` if acquired.
+#[napi]
+pub async fn try_lock(
     fd: os::FileDescriptor,
-    f: impl FnOnce(os::FileDescriptor) -> std::io::Result<LockAttempt> + Send + Clone + 'static,
-) -> napi::Result<LockAttempt> {
-    tokio::task::spawn_blocking(move || f(fd))
+    mode: Lock,
+    range: Option<LockRange>,
+) -> napi::Result<bool> {
+    let range = range.map(TryInto::try_into).transpose()?;
+    tokio::task::spawn_blocking(move || os::file_lock(fd, mode, range, false))
         .await
-        .map_err(|e| napi::Error::from_reason(e.to_string()))
-        .and_then(|result| result.map_err(|e| napi::Error::from_reason(e.to_string())))
+        .map_err(task_error)?
+        .map(|a| matches!(a, LockAttempt::Acquired))
+        .map_err(io_error)
 }
 
+/// Synchronous non-blocking lock attempt. Returns `true` if acquired.
+#[napi]
+pub fn try_lock_sync(
+    fd: os::FileDescriptor,
+    lock: Lock,
+    range: Option<LockRange>,
+) -> napi::Result<bool> {
+    let range = range.map(TryInto::try_into).transpose()?;
+    let locked = os::file_lock(fd, lock, range, false).map_err(io_error)?;
+    Ok(matches!(locked, LockAttempt::Acquired))
+}
+
+/// Options for the polling lock loop.
 #[napi(object)]
-pub struct PollFlockOptions {
+#[derive(Debug, Clone, Copy)]
+pub struct PollOptions {
     pub poll_ms: Option<u32>,
     pub timeout: Option<u32>,
+    /// Multiplier applied to the poll interval after each failed attempt.
+    /// For example, `2.0` doubles the delay each iteration (exponential backoff).
+    pub backoff: Option<f64>,
 }
 
-pub(crate) async fn poll_lock(
-    options: Option<PollFlockOptions>,
-    attempt_lock: impl Fn() -> std::io::Result<LockAttempt> + Send + Clone + 'static,
+/// Poll a non-blocking lock in a loop until acquired or timeout expires.
+/// The entire loop runs inside a single `spawn_blocking` call to avoid
+/// repeated task spawning overhead.
+async fn poll_lock(
+    fd: os::FileDescriptor,
+    mode: Lock,
+    range: Option<LockRange>,
+    options: Option<PollOptions>,
 ) -> napi::Result<()> {
-    let poll_ms = options.as_ref().and_then(|o| o.poll_ms).unwrap_or(10) as u64;
+    let range = range.map(TryInto::try_into).transpose()?;
+
+    let poll_ms = options.as_ref().and_then(|o| o.poll_ms).unwrap_or(10) as f64;
+    let backoff = options.as_ref().and_then(|o| o.backoff).unwrap_or(1.0);
     let timeout = options
         .as_ref()
         .and_then(|o| o.timeout)
         .map(|t| Duration::from_millis(t as u64));
-    let start = Instant::now();
 
-    loop {
-        // 1. Clone the closure so we have a fresh copy for this iteration
-        let attempt = attempt_lock.clone();
-
-        // 2. Pass the cloned closure to spawn_blocking
-        let locked = tokio::task::spawn_blocking(attempt)
-            .await
-            .map_err(|e| napi::Error::from_reason(e.to_string()))??;
-
-        if matches!(locked, LockAttempt::Acquired) {
-            return Ok(());
-        }
-        if let Some(timeout) = timeout {
-            if start.elapsed() >= timeout {
-                return Err(napi::Error::from_reason("Timed out acquiring lock"));
+    tokio::task::spawn_blocking(move || {
+        let deadline = timeout.map(|t| std::time::Instant::now() + t);
+        let mut delay_ms = poll_ms;
+        loop {
+            let result = os::file_lock(fd, mode, range, false).map_err(io_error)?;
+            if matches!(result, LockAttempt::Acquired) {
+                return Ok(());
             }
+            if let Some(d) = deadline {
+                if std::time::Instant::now() >= d {
+                    return Err(timeout_error());
+                }
+            }
+            std::thread::sleep(Duration::from_millis(delay_ms as u64));
+            delay_ms *= backoff;
         }
-        tokio::time::sleep(Duration::from_millis(poll_ms)).await;
+    })
+    .await
+    .map_err(task_error)?
+}
+
+impl TryInto<(os::Offset, os::Length)> for LockRange {
+    type Error = std::io::Error;
+
+    fn try_into(self) -> Result<(os::Offset, os::Length), Self::Error> {
+        if self.offset < 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Range offset cannot be negative.",
+            ));
+        }
+
+        if self.length <= 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Range length must be > 0. Zero-length (EOF) range locks are not supported.",
+            ));
+        }
+
+        let (offset, length) = (self.offset as os::Offset, self.length as os::Length);
+        if offset.checked_add(length).is_none() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "Range overflow: offset {} + length {} exceeds max",
+                    offset, length
+                ),
+            ));
+        }
+
+        Ok((offset, length))
     }
 }
 
-pub(crate) enum LockAttempt {
-    Acquired,
-    WouldBlock,
+fn io_error(err: std::io::Error) -> napi::Error {
+    match err.kind() {
+        std::io::ErrorKind::InvalidInput => {
+            napi::Error::new(napi::Status::InvalidArg, err.to_string())
+        }
+        _ => napi::Error::new(napi::Status::GenericFailure, err.to_string()),
+    }
+}
+
+fn task_error(err: tokio::task::JoinError) -> napi::Error {
+    napi::Error::new(
+        napi::Status::GenericFailure,
+        format!("Lock task panicked: {}", err),
+    )
+}
+
+fn timeout_error() -> napi::Error {
+    napi::Error::from_reason("Timed out acquiring lock")
 }
