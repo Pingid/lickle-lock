@@ -17,12 +17,16 @@ tokio = { version = "1", features = ["rt-multi-thread", "time"] }
 libc = "0.2.153"
 
 [target.'cfg(windows)'.dependencies]
-libc = "0.2.153"
-windows-sys = { version = "0.61.2", features = [
-    "Win32_Foundation",
-    "Win32_Storage_FileSystem",
-    "Win32_System_IO",
-    "Win32_System_LibraryLoader",
+winapi = { version = "0.3.9", features = [
+    "winerror",
+    "minwinbase",
+    "minwindef",
+    "fileapi",
+    "libloaderapi",
+    "handleapi",
+    "ioapiset",
+    "synchapi",
+    "winnt",
 ] }
 
 [build-dependencies]

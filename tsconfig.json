@@ -8,6 +8,7 @@
     "rootDir": "." /* Specify the root folder within your source files. */,
     "module": "NodeNext" /* Specify what module code is generated. */,
     "moduleResolution": "nodenext" /* Specify how TypeScript looks up a file from a given module specifier. */,
+    "allowJs": true /* Allow JavaScript files to be imported. */,
 
     /* Emit */
     "noEmit": true,
@@ -45,5 +46,5 @@
     /* Completeness */
     "skipLibCheck": true /* Skip type checking all .d.ts files. */
   },
-  "include": ["lib/**/*"]
+  "include": ["lib/**/*", "tests/**/*"]
 }

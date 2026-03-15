@@ -1,87 +1,127 @@
-import { type Backend, type FileHandle, type NodeFileHandle, FileGuard, defaultBackend } from './backend/index.js'
-export * from './backend/index.js'
+import {
+  type NodeFileHandle,
+  type LockRange,
+  type PollOptions,
+  type Lock,
+  type FileHandle,
+  type FileDescriptor,
+  type Fs,
+  type Locker,
+  FileLockGuard,
+  LockGuard,
+  defaultFs,
+  defaultLocking,
+} from './core/index.js'
+export * from './core/index.js'
+
+/** Options for specifying a custom locker and/or byte range. */
+export interface LockingOptions {
+  /** Custom locker implementation. Uses the default native locker if omitted. */
+  locking?: Locker
+  /** Byte range to lock. Locks the entire file if omitted. */
+  range?: LockRange
+}
 
 /**
- * Acquire an exclusive (write) lock on a file, polling until available.
- * Creates the file if it does not exist.
+ * Acquire a lock on an already-open file handle.
  *
  * @example
- * const guard = await exclusive('/tmp/my.lock')
- * try { /* critical section *\/ } finally { await guard.drop() }
- *
- * @example
- * await using guard = await exclusive('/tmp/my.lock', { timeout: 5000 })
+ * import fs from 'node:fs/promises'
+ * const handle = await fs.open('/tmp/my.lock', 'r+')
+ * await using guard = await lock(handle, Lock.Exclusive)
  */
-export const exclusive = async <H extends FileHandle = NodeFileHandle>(
-  file: string,
-  options?: { backend?: Backend<H>; pollMs?: number; timeout?: number },
-): Promise<FileGuard<H>> => acquireLock(file, 'exclusive', options)
+export const lock = async <H extends FileHandle = NodeFileHandle>(
+  handle: H,
+  type: Lock,
+  options?: LockingOptions & PollOptions,
+): Promise<LockGuard<H>> => {
+  const { locking = defaultLocking() } = options ?? {}
+  await locking.lock(handle, type, options?.range, options)
+  return new LockGuard<H>(locking, handle, options?.range)
+}
 
 /**
- * Try to acquire an exclusive lock without waiting.
- * Return undefined if the lock is already held.
+ * Try to acquire a lock on an already-open file handle without waiting.
  *
  * @example
- * const guard = await tryExclusive('/tmp/my.lock')
+ * import fs from 'node:fs/promises'
+ * const handle = await fs.open('/tmp/my.lock', 'r+')
+ * const guard = await tryLock(handle, Lock.Exclusive)
  * if (guard) { /* acquired *\/ }
  */
-export const tryExclusive = async <H extends FileHandle = NodeFileHandle>(
-  file: string,
-  options?: { backend?: Backend<H> },
-): Promise<FileGuard<H> | undefined> => tryAcquireLock(file, 'exclusive', options)
+export const tryLock = async <H extends FileDescriptor>(
+  handle: H,
+  type: Lock,
+  options?: LockingOptions & PollOptions,
+): Promise<LockGuard<H> | undefined> => {
+  const { locking = defaultLocking() } = options ?? {}
+  const result = await locking.tryLock(handle, type, options?.range)
+  if (result) return new LockGuard<H>(locking, handle, options?.range)
+  return undefined
+}
 
 /**
- * Acquire a shared (read) lock on a file, polling until available.
- * Multiple shared locks may be held concurrently.
- * Creates the file if it does not exist.
+ * Release a lock on a file descriptor or file handle.
  *
  * @example
- * await using guard = await shared('/tmp/my.lock')
+ * import fs from 'node:fs/promises'
+ * const handle = await fs.open('/tmp/my.lock', 'r+')
+ * await lock(handle, Lock.Exclusive)
+ * // ... critical section ...
+ * await unlock(handle)
  */
-export const shared = async <H extends FileHandle = NodeFileHandle>(
-  file: string,
-  options?: { backend?: Backend<H>; pollMs?: number; timeout?: number },
-): Promise<FileGuard<H>> => acquireLock(file, 'shared', options)
+export const unlock = async <H extends FileDescriptor>(handle: H, options?: LockingOptions): Promise<void> => {
+  const { locking = defaultLocking() } = options ?? {}
+  await locking.unlock(handle, options?.range)
+}
+
+/** Options for open-and-lock functions that manage the file lifecycle. */
+export interface OpenLockOptions<H extends FileHandle> extends LockingOptions {
+  /** Custom filesystem for opening files. Uses the default Node.js fs if omitted. */
+  fs?: Fs<H>
+}
 
 /**
- * Try to acquire a shared lock without waiting.
- * Return undefined if an exclusive lock is already held.
+ * Open a file and acquire a lock, polling until available. Closes the file on failure.
  *
  * @example
- * const guard = await tryShared('/tmp/my.lock')
- * if (guard) { /* acquired *\/ }
+ * await using guard = await openLock('/tmp/my.lock', Lock.Exclusive)
+ *
+ * @example
+ * await using guard = await openLock('/tmp/my.lock', Lock.Shared, { timeout: 5000 })
  */
-export const tryShared = async <H extends FileHandle = NodeFileHandle>(
+export const openLock = async <H extends FileHandle = NodeFileHandle>(
   file: string,
-  options?: { backend?: Backend<H> },
-): Promise<FileGuard<H> | undefined> => tryAcquireLock(file, 'shared', options)
-
-const acquireLock = async <H extends FileHandle = NodeFileHandle>(
-  file: string,
-  mode: 'exclusive' | 'shared',
-  options?: { backend?: Backend<H>; pollMs?: number; timeout?: number },
-): Promise<FileGuard<H>> => {
-  const { backend = defaultBackend() as unknown as Backend<H> } = options ?? {}
-  const handle = await backend.open(file)
+  type: Lock,
+  options?: OpenLockOptions<H> & PollOptions,
+): Promise<FileLockGuard<H>> => {
+  const { fs = defaultFs() as unknown as Fs<H> } = options ?? {}
+  const handle = await fs.open(file, type)
   try {
-    await backend.lock(handle, mode, options)
-    return new FileGuard<H>(backend, handle)
+    return new FileLockGuard<H>(await lock(handle, type, options), handle)
   } catch (error) {
     await handle.close()
     throw error
   }
 }
 
-const tryAcquireLock = async <H extends FileHandle = NodeFileHandle>(
+/**
+ * Open a file and try to acquire a lock without waiting. Closes the file if not acquired.
+ *
+ * @example
+ * const guard = await tryOpenLock('/tmp/my.lock', Lock.Exclusive)
+ * if (guard) { /* acquired *\/ }
+ */
+export const tryOpenLock = async <H extends FileHandle = NodeFileHandle>(
   file: string,
-  mode: 'exclusive' | 'shared',
-  options?: { backend?: Backend<H> },
-): Promise<FileGuard<H> | undefined> => {
-  const { backend = defaultBackend() as unknown as Backend<H> } = options ?? {}
-  const handle = await backend.open(file)
+  type: Lock,
+  options?: OpenLockOptions<H>,
+): Promise<FileLockGuard<H> | undefined> => {
+  const { fs = defaultFs() as unknown as Fs<H> } = options ?? {}
+  const handle = await fs.open(file, type)
   try {
-    const result = await backend.tryLock(handle, mode)
-    if (result) return new FileGuard<H>(backend, handle)
+    const result = await tryLock(handle, type, options)
+    if (result) return new FileLockGuard<H>(result, handle)
     await handle.close()
     return undefined
   } catch (error) {
