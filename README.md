@@ -1,9 +1,9 @@
 # @lickle/lock
 
 [![Build Status](https://img.shields.io/github/actions/workflow/status/Pingid/lickle-lock/CI.yml?branch=main&style=flat&colorA=000000&colorB=000000)](https://github.com/Pingid/lickle-lock/actions?query=workflow:CI)
-[![Build Size](https://img.shields.io/bundlephobia/minzip/@lickle/lock?label=bundle%20size&style=flat&colorA=000000&colorB=000000)](https://bundlephobia.com/result?p=@lickle/lock)
 [![Version](https://img.shields.io/npm/v/@lickle/lock?style=flat&colorA=000000&colorB=000000)](https://www.npmjs.com/package/@lickle/lock)
-[![Downloads](https://img.shields.io/npm/dt/@lickle/lock.svg?style=flat&colorA=000000&colorB=000000)](https://www.npmjs.com/package/@lickle/lock)
+[![Downloads](https://img.shields.io/npm/dw/@lickle/lock?style=flat&colorA=000000&colorB=000000)](https://www.npmjs.com/package/@lickle/lock)
+[![License](https://img.shields.io/github/license/Pingid/lickle-lock?style=flat&colorA=000000&colorB=000000)](./LICENSE)
 
 File-based locking for Node.js using native OS locks (`flock` on Unix, `LockFileEx` on Windows).
 
